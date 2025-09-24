@@ -1,0 +1,15 @@
+[package]
+name = "eye-simple"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "eye-simple"
+path = "src/main_simple.rs"
+
+[dependencies]
+# Минимальные зависимости для тестовой сборки
+
+[target.'cfg(windows)'.dependencies]
+# Только базовые Windows зависимости
+winapi = { version = "0.3", features = ["winuser"] }

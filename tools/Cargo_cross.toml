@@ -1,0 +1,11 @@
+[package]
+name = "eye-cross"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "eye-cross"
+path = "src/main_cross.rs"
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }

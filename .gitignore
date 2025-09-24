@@ -1,0 +1,34 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Logs
+*.log
+temp/
+
+# Release builds (keep in releases folder)
+!/releases/*.exe
+
+# Tools and intermediate files
+/tools/*.exe
+/tools/*.pdb
+
+# Documentation builds
+/docs/build/
