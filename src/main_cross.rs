@@ -1,8 +1,8 @@
 // Кросс-платформенная тестовая версия
 use std::env;
 
-const BOT_TOKEN: &str = "8392892206:AAFspuWe6_OK0_wB3uqk3E7YvtHHkvtvvZE";
-const AUTHORIZED_CHAT_ID: i64 = 7987854520;
+const BOT_TOKEN: &str = "8392892206:AAFspuWe6_OK0_wB3uqk3E7YvtHHkvtvvZE"; //test token
+const AUTHORIZED_CHAT_ID: i64 = 2382932992; //test
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
