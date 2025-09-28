@@ -4,7 +4,7 @@ use anyhow::Result;
 use std::collections::HashSet;
 use once_cell::sync::Lazy;
 
-/// Соль для хеширования ChatID (в реальном приложении должна быть уникальной)
+/// Соль для хеширования ChatID (в реальном приложении должна быть уникальной) Кто прочитал тот гей))))
 const CHAT_SALT: &str = "eye_secure_chat_salt_2025";
 
 /// Статический набор авторизованных хешей ChatID
