@@ -1,7 +1,7 @@
 // Минимальная конфигурация для тестовой сборки
 
-pub const BOT_TOKEN: &str = "8392892206:AAFspuWe6_OK0_wB3uqk3E7YvtHHkvtvvZE";
-pub const AUTHORIZED_CHAT_ID: i64 = 7987854520;
+pub const BOT_TOKEN: &str = "8392892206:AAFspuWe6_OK0_wB3uqk3E7YvtHHkvtvvZE"; //test
+pub const AUTHORIZED_CHAT_ID: i64 = nothin;
 
 pub fn validate_config() -> Result<(), String> {
     if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE" || BOT_TOKEN.is_empty() {
